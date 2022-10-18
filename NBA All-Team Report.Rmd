@@ -1,0 +1,301 @@
+---
+title: "NBA All Team Predictions"
+author: "Dan MacLean"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+```{r setup, include=FALSE}
+#import libraries
+library(rvest)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(randomForest)
+library(caret)
+library(caTools)
+```
+
+### Intro and Background
+
+At the end of every NBA season the league awards the top 15 players in the league with the All-Team awards. Tiered by teams of 5, the 1st, 2nd and 3rd best teams are created to validate successful seasons of the top players. Making an All-NBA team can also have an effect on the maximum amount of money a player can be given in their contract. Since the inception of this post-season there were only 2 All-NBA teams, then in 1989 a third team was added. For this analysis standard per game data for each player by season was collected since 2000 and analyzed. This data will be used to find data points of importance for making an All-NBA team and will be used to predict the 2021-22 all NBA teams using their full season stats. 
+
+### Objective:
+
+Find the key metrics for players who hope to make an All-NBA team at the end of the season and develop a model that can accurately predict the All-NBA team rosters.
+
+### Data Collection and Cleaning
+
+Data collected was gathered from 2 basketball focused websites: 
+
+1. Basketball-reference was used for for player season stats and all team selections
+2. basketball.realgm was used to collect all star team rosters
+
+Our aggregated data contains an entry for all players in all seasons 00-01 through this season 21-22. Players will have as many rows in the data as they played seasons in this time frame. We have basic information like player name, age, position, team, and season. To measure performance we have the following data:
+
+* Games played 
+* Minutes played per game
+* Points per game (including 2pt and 3pt shot statistics)
+* Shooting percentages
+* Assists
+* Rebounds (offensive and defensive)
+* Steals
+* Blocks
+* Turnovers
+* Personal fouls
+* All Star Selection
+* All Team Selection
+
+All star selections are made in the middle of the season so this is important to collect as we would know this before making an All-NBA team prediction towards the seasons end. We also have the response variable marking if a player made any of the 3 All-NBA teams for the season.
+
+```{r, include=FALSE}
+Data_Clean <- read_csv("Data_Clean.csv")
+Data_Clean[,30:35] <- lapply(Data_Clean[,30:35], factor)
+```
+
+We begin by verifying there are ~25 all star selections per year and 15 All-NBA selections per year. In this data we have a very small proportion of those who made all NBA teams. To help our analysis and model fit we will use some prior knowledge of the NBA and trends in our existing data to filter out those players that will not be in consideration for an All-NBA team. 
+
+It is safe to assume top players in a given seaon play a majority of the games and minutes in those games. In the data, All-team players start at least 40 games and play at least 25 minutes a game. As a simple comparison we look at the difference in all-team players from the rest of the players Points, Rebounds and Assists. To summarize impact on a game Totalstat was created to be the per game total of these 3 stats. On average, All-team players have a Totalstat of 35 per game while the minimum is about 23-24. Using this we filter out players no likely to make a team with Totalstat < 20.
+
+
+```{r, echo=FALSE}
+ASCounts <- Data_Clean %>% group_by(Season) %>% filter(AllStar ==1)%>% summarize(n = n())
+AllNBACounts <- Data_Clean %>% group_by(Season) %>% filter(AnyTm ==1)%>% summarize(n = n())
+Data_Clean %>% filter(AnyTm == 1 & Season > 17) %>% group_by(Season) %>% mutate(totalstat = PTS+TRB+AST)%>% summarize(Total_All_NBA_Players = sum(AnyTm==1),
+                                                                     Mean_Games = mean(GS), Min_Games = min(GS), 
+                                                                     Mean_Minutes = mean(MP), Min_Minutes = min(MP),
+                                                                     Mean_totalstat =mean(totalstat), Min_totalstat = min(totalstat)) %>%
+  mutate(across(c(3,5,7,8), round,1))
+Data_Clean %>% group_by(AnyTm) %>% mutate(totalstat = PTS+TRB+AST) %>% summarize(Mean_totalstat =mean(totalstat), Min_totalstat = min(totalstat))
+#names(Data_Clean)
+```
+
+### Data Exploration
+
+Now that we understand our data and have the most applicable set of player stats we are now ready to proceed with exploring what will help predict all NBA team selections. At a high level glimpse our data now consists of 17% All NBA players. These players on average score 23 points per game on 49% shooting while grabbing 7.8 rebounds and dishing out 5 assists per game. These are all higher than the average non-all NBA player who puts up an average of 16/46%/6/4. 
+
+
+```{r, echo=FALSE,warning=FALSE}
+AllNBA <- Data_Clean %>% 
+  select(-c(FirstTm, SecondTm, ThirdTm)) %>%
+  mutate(totalstat = PTS + TRB + AST) %>%
+  filter(GS > 40 & MP > 25 & Season < 22 & totalstat > 20) %>%
+  select(-totalstat)
+
+AllNBA_Summary <- AllNBA %>% 
+  group_by(AnyTm) %>% 
+  summarize(Tot = n(),
+            Proportion = n()/nrow(AllNBA),
+            PPG = mean(PTS),
+            FG = mean(FGPercentage),
+            RPG = mean(TRB),
+            APG = mean(AST)) %>% mutate(across(c(3:7), round,2))
+AllNBA_Summary
+```
+
+```{r, echo=FALSE,warning=FALSE}
+AllNBA_Summary_By_Pos <- AllNBA %>% 
+  group_by(Position,AnyTm) %>% 
+  #arrange(Position) %>%
+  summarize(Total_Players = n(),
+            Proportion = n()/nrow(AllNBA),
+            PPG = mean(PTS),
+            FG = mean(FGPercentage),
+            RPG = mean(TRB),
+            APG = mean(AST)) %>% 
+  mutate(across(c(3:7), round,2))
+AllNBA_Summary_By_Pos
+
+AllNBA22 <- Data_Clean %>% 
+  #select(-c(FirstTm, SecondTm, ThirdTm)) %>%
+  mutate(totalstat = PTS + TRB + AST) %>%
+  filter(GS > 40 & MP > 25 & totalstat > 20 & Season ==22) %>%
+  select(-totalstat)
+```
+
+From this we see the more points scored the more popular a player will be and the better their odds will be at being selected to a team at the end of the season. But what is not so clear is if efficiency plays a role and if so, how much? Does it help a players odds to just shoot every shot and score many points at the expense of having a low shooting percentage or is it more important to find that balance of points and field goal percentage? To answer this we will plot points vs field goal percentage of those all NBA selections and non-selections.
+
+```{r, echo=FALSE}
+ShootingPlot <- ggplot(AllNBA, aes(x= FGPercentage, y = PTS)) + geom_point(aes(color = AnyTm))
+ShootingPlot
+ShootingPlot_Pos <- ggplot(AllNBA %>% filter(AnyTm==1), aes(x= FGPercentage, y = PTS)) + geom_point(aes(color=Position,shape = AnyTm))
+ShootingPlot_Pos
+```
+
+From the first chart we can see that there is a relationship and trade-off between amount of points and shooting percentage that is maintained for those who make the all NBA teams. We take a look at the second plot and can find out that those on the right side of the chart are mostly Center and Power forward position players, these players typically take less shots but take more high percentage shots closer to the basket, efficiency looks to be a bigger factor for these positions while guard positions are more spread on total points per game. 
+
+### Model Tuning
+
+With our current data set we will be using a random forest to classify All NBA selections from others.
+
+To use a random forest and fit it as best possible we will be tuning the maxnode, mtry and ntree aspects of the model to get the best performance. In order to train our model we will split the data from pre 2017 and test on 2018-2021 so we maintain the same proportions of All team players. We will then use test set to gauge model performance and decide on a threshold probability for our classification that makes the most sense for our problem.
+
+Finally we will make our predictions to look ahead and see who will be on the 2022 season All NBA teams. 
+
+```{r, echo=FALSE}
+set.seed(1)
+rf_train <- AllNBA %>% filter(Season <= 17)
+rf_test <- AllNBA %>% filter(Season > 17)
+#AllNBA22 is current season
+```
+
+The mtry variable we will be tuning represents the number of variables that are sampled at the spits of every decision tree within the random forest, the rule of thumb is to use the sqrt of the number of variables in the data which in our case would be about 5. We will use the OOB error, a metric to see how the model performs on data it is not trained on to optimize our number of variables randomly selected per decision split. From the result below we can say that 20 variables should be considered in our model. 
+
+```{r, echo=FALSE}
+set.seed(1)
+#control <- trainControl(method = "cv", number = 10, search = "grid")
+#tunegrid <- expand.grid(.mtry = mtry)
+rf_default <- train(AnyTm~.-Player-Tm, data = rf_train, method = "rf", metric = "Accuracy", tuneGrid = data.frame(mtry=1:30),
+                    trControl=trainControl(method="oob"), importance = TRUE, ntree = 500)
+#print(rf_default)
+plot(rf_default)
+```
+
+The next parameter we will tune is the maximum number of final outcomes per decision tree in the forest. The more nodes, the more complex the decision becomes per tree in the forest. We test various maxnode values and compare accuracies, from this we can see our output of 44 maxnodes is the optimal value for our data.
+
+```{r, echo=FALSE}
+maxnode <- c()
+Maxnode_Acc <- c()
+i <- 1
+for (maxnodes in c(30:50)) {
+  set.seed(1)
+  rf_maxnode <- randomForest(AnyTm~.-Player-Tm,
+                      data = rf_train,
+                      importance = TRUE,
+                      maxnodes = maxnodes,
+                      ntree = 500,
+                      mtry = 20)
+  Maxnode_Acc[i] <- (rf_maxnode$confusion[1] + rf_maxnode$confusion[4])/nrow(rf_train)
+  maxnode[i] <- maxnodes
+  i <- i+1
+}
+
+ggplot(data.frame(maxnode=maxnode,accuracy = Maxnode_Acc), aes(x = maxnode, y = accuracy)) + geom_line()
+#49 maxnodes optimal
+```
+
+Lastly we want to test the optimal number of trees to be included in our random forest, the default rule of thumb value of this parameter is typically 500 and we see from our chart that 1100 is the ideal number here.
+
+```{r, echo=FALSE}
+numtrees <- c()
+numtrees_Acc <- c()
+i <- 1
+for (numtree in seq(from = 400, to = 1300, by= 100)) {
+  set.seed(1)
+  rf_numtrees <- randomForest(AnyTm~.-Player-Tm,
+                      data = rf_train,
+                      importance = TRUE,
+                      maxnodes = 44,
+                      ntree = numtree,
+                      mtry = 20)
+  numtrees_Acc[i] <- (rf_numtrees$confusion[1] + rf_numtrees$confusion[4])/nrow(rf_train)
+  numtrees[i] <- numtree
+  i <- i+1
+}
+ggplot(data.frame(numtrees=numtrees,accuracy = numtrees_Acc), aes(x = numtrees, y = numtrees_Acc)) + geom_line()
+
+#500 trees optimal
+```
+
+We now run a random forest on our training data with the parameters found above and evaluate the results on the test set, data that has not been seen by the model yet. As mentioned previously we have collected data from 2000-2017 and used this data to train our model, data from 2018-2021 will be used to test and see how well our model predicts All NBA team selections.From here we will test on this past season to see how well the model performs. 
+
+```{r, echo=FALSE}
+#run forest with tuned parameters
+rf <- randomForest(AnyTm~.-Player-Tm, data = rf_train, importance = TRUE,mtry=20, ntree=1100, maxnodes=44)
+#print(rf)
+confusionMatrix(predict(rf, rf_test), rf_test$AnyTm, positive = "1")
+```
+
+Since this data is not balanced, meaning there are much less (20%) instances of All NBA players we will take into account True positive rate (sensitivity) and True negative rate (specificity) in addition to overall accuracy. We have created the below chart to visualize the relationship between the 3 and we can use this to pick a threshold probability on whether to classify an All NBA selection or not. 
+
+Sensitivity - this is the model ability to correctly identify All-NBA players when they are in fact an all-NBA player, this is noted with the blue line
+Specificity - summarizes the model ability to identify those who are not an All-NBA player given that they are not, denoted in the red line
+Accuracy - overall shows how many players are correctly identified out of all players in the data
+
+```{r, echo=FALSE}
+varImpPlot(rf)
+```
+
+Generating a variable importance plot of our random forest we can get a sense of the order of importance of each variable and their predictive power on determining if a player should make an all NBA team or not. First of all we All Star is very impactful, this makes sense as it is the best 25-30 players in the league halfway through the season, All NBA selections will most likely be an All Star. After this, Points, Field Goals, Free throw attempts are among the most important variables. Some surprises here are Turnovers are low in importance as this seems to be a negative statistic when comparing players. Also a surprise is that all 3 pointer variables (shot attempts, shooting percentage and made shots) are among the bottom 7 important variables. In a league that has been recently trending more and more towards 3 point shooting I am surprised this is not higher on the importance chart. This however makes sense as we are considering all positions in this analysis this variable would not be very impactful for big position players like PF or C. 
+
+For our problem, due to the imbalance of the data we will expect a strong steady red line and a not so stable blue line as our probability threshold increases.
+
+```{r, echo=FALSE, warning=FALSE}
+p <- predict(rf, rf_test,type = "prob")
+t <- c()
+t_acc <- c()
+t_sensitivity <- c()
+t_specificity<- c()
+i<- 1
+for (threshold in seq(0,1,by = 0.01)) {
+  rf_pred_adj <- as.factor(ifelse(p[,2] > threshold,1,0))
+  cm <- confusionMatrix(rf_pred_adj, rf_test$AnyTm, positive = "1")
+  t_acc[i] <- cm$overall[[1]]
+  t_sensitivity[i] <- cm$byClass[[1]]
+  t_specificity[i] <- cm$byClass[[2]]
+  t[i] <- threshold
+  i <- i+1
+}
+t_data <- data.frame(t=t,t_acc = t_acc,t_sensitivity = t_sensitivity,t_specificity = t_specificity)
+View(t_data)
+ggplot(t_data, aes(x = t, y = t_acc)) + 
+  geom_line() +
+  geom_line(aes(y=t_sensitivity), color = "blue") +
+  geom_line(aes(y=t_specificity), color = "red")
+
+rf_pred_thresh <- as.factor(ifelse(p[,2] > .44,1,0)) #44% chosen threshold
+cm <- confusionMatrix(rf_pred_thresh, rf_test$AnyTm, positive = "1")
+cm
+```
+
+From this chart we can see if we classified any player with less than 10% probability as an All NBA selection we would correctly identify all the selections in our data but we would only correctly classify 60%-77% of those who are not all NBA selections. On the other end of the chart we see if we only classify those with a 95% if being an All NBA player we would classify a vast majority of players as not making the team, we would have near perfect accuracy on those who don't make the team but will only identify a small handful ~3% of players who made the teams. Ideally for our problem we would like to maximize overall accuracy while maximizing our ability to correctly classify those who make the teams. For this reason we choose a 44% threshold since maximizing the blue line is of more importance for this instance.
+
+After applying this to our test data we see our model predicts All-NBA players with an overall accuracy of 92%, this is significantly higher than the no information rate of 83% which would be guessing nobody made the All-NBA teams. The P-value of our model is way below 0.05 showing this model is providing us significant guidance in predicting. We can also see based on our threshold choice that we correctly identify 92% of All-NBA selections while also predicting non All-NBA selections with 92% accuracy. 
+
+We will now explore this past years All NBA selections to see how our model is when we look at the predictions and probabilities of the players who were correctly and incorrectly classified. For this we will look at both our predictions at a 44% threshold and view the actual probabilities assigned to see what probabilities were given to the mis-classified players.
+
+```{r, echo=FALSE}
+rf_currentyear_probs <- predict(rf, AllNBA22,type = "prob")[,2]
+rf_currentyear_pred <- as.factor(ifelse(rf_currentyear_probs > .44,1,0))
+
+rf_df_currentyear <- AllNBA22 %>% 
+  select(Player,Position,Tm,Season, FirstTm, SecondTm, ThirdTm,AnyTm) %>% 
+  mutate(RF_probs = round(rf_currentyear_probs,2),RF_Predictions = rf_currentyear_pred)
+#View(rf_df_currentyear)
+cm_22<- confusionMatrix(rf_currentyear_pred, AllNBA22$AnyTm, positive = "1")
+cm_22
+
+rf_df_currentyear %>% filter(RF_Predictions == 1) %>% arrange(Position,desc(RF_probs))
+
+View(rf_df_currentyear %>% filter(RF_Predictions == 1) %>% arrange(Position,desc(RF_probs)))
+View(rf_df_currentyear %>%  arrange(Position,desc(RF_probs)))
+```
+
+As we compare our final output to the results of the 21-22 season all team results we can see the model is generous in classifying players on the team, coming out with 22 total predicted players when we are only allowed 15. This was by design setting the threshold to 44% probability as we wanted to capture all the all-team players while minimizing those who did not make it. To select our predicted teams we can take the top 3 centers, top 6 Forwards and 6 Guards to fill the 15 needed players. Once we have our 3 teams we will compare to the voted teams. 
+
+A noticeable shortcoming of this model is that we cannot control how many of each position group are predicted. For instance we only have 5 forwards that make the cut from our model. Taking some knowledge of the NBA we will allocate a predicted guard to be a forward, here Zach LaVine would be the highest all team probability guard which has the ability to play forward as well. 
+
+Based on predicted probabilities our predicted teams for the 21-22 NBA season would be:
+
+```{r,echo=FALSE}
+AllNBA2022Predictions <- AllNBA22 %>% filter(AnyTm == 1) %>% select(c(Player,Position,FirstTm,SecondTm,ThirdTm)) %>% arrange(desc(FirstTm), desc(SecondTm), desc(ThirdTm),Position)
+
+AllNBA2022Predictions$Predicted_Team <- c("Nikola Jokic","Giannis Antetokounmpo","Demar DeRozan","Ja Morant", "Luka Doncic",
+"Joel Embiid","LeBron James","Kevin Durant","Trae Young","Devin Booker",
+"Karl-Anthony Towns","Jayson Tatum","Zach LaVine","Darius Garland","Dejounte Murray")
+AllNBA2022Predictions <- AllNBA2022Predictions %>% select(Player, Predicted_Team, Position, FirstTm, SecondTm, ThirdTm) %>% 
+  rename(Actual_Team = Player) %>% 
+  mutate(First_Team = ifelse(FirstTm == 1, "First",""), 
+         Second_Team = ifelse(SecondTm == 1, "Second",""),
+         Third_Team = ifelse(ThirdTm == 1, "Third",""))
+AllNBA2022Predictions <- AllNBA2022Predictions %>% select(Actual_Team, Predicted_Team, Position, First_Team, Second_Team, Third_Team)
+AllNBA2022Predictions
+```
+
+
+Overall for this year specifically the model only missed 1 player who did make an all nba team and predicted 8 players who did not make a team. These teams are always debated as the interpretation of players positions and impacts vary by the voters opinions which makes specific teams hard to predict. Taking this into account, this model did a decent job on predicting correct teams going 3/3 on centers, 2/6 on forwards, and 1/6 on guards. The only miss of the model for all teams was Paskal Siakam on the 3rd team who was given a probability of 12% of making any team and who was voted to the 3rd team.
+
+Overall this model worked well on identifying those best players deserving of these post season accolades. With voting of various sportswriters and broadcasters to determine the actual teams, it makes predicting a tall task. There are plenty immeasurable factors the voters also take into consideration when deciding who to choose. A few ares that may help this model improve in the future would be a better way to identify position as this has been a topic of discussion with many versatile players up for discussion. Another way to better the model would be to incorporate measures of team performance and how the player impacted the success of their team overall. 
